@@ -15,14 +15,13 @@ Usage in beancount:
 This will multiply all GOOG units before 2022-07-15 by 20 and divide
 the price by 20, keeping the total value unchanged.
 """
-from beancount.core.data import Cost, Entries, Transaction, Posting, Amount, Price
+from beancount.core.data import Cost, Entries, Transaction, Posting, Amount, Price, Balance, Price as PriceEntry
 from dataclasses import dataclass
 import collections
 from datetime import timedelta, datetime, date
 from decimal import Decimal
 import sys
-from typing import Callable
-from typing import Any
+from typing import Callable, Any, Union
 import yaml
 
 __plugins__ = ['stock_split']
@@ -34,28 +33,63 @@ def stock_split(entries: Entries, _: dict, plugin_config: str):
   config: dict = yaml.safe_load(plugin_config)
   splits: dict[str, Any] = {l['symbol']: l for l in config['splits']}
   errors: list[str] = []
+  
+  new_entries = []
   for entry in entries:
-    if not isinstance(entry, Transaction):
-      continue
-    for posting in entry.postings:
-      assert isinstance(posting, Posting)
-      if posting.units.currency not in splits:
-        continue
-      s = splits[posting.units.currency]
-      date = s['date']
-      assert entry.date != date
-      assert not posting.cost and posting.price
-      if entry.date > date:
-        continue
-      assert posting.units.number and posting.price.number
-      entry.postings.remove(posting)
-      entry.postings.append(
-          posting._replace(
-              units=Amount(posting.units.number * Decimal(s['ratio']),
-                           posting.units.currency),
-              price=Amount(posting.price.number / Decimal(s['ratio']),
-                           posting.price.currency),
-          ))
-      break
+    if isinstance(entry, Transaction):
+      new_postings = []
+      modified = False
+      for posting in entry.postings:
+        if posting.units.currency not in splits:
+          new_postings.append(posting)
+          continue
+        
+        s = splits[posting.units.currency]
+        split_date = s['date']
+        if entry.date >= split_date:
+          new_postings.append(posting)
+          continue
+        
+        ratio = Decimal(s['ratio'])
+        new_units = Amount(posting.units.number * ratio, posting.units.currency)
+        
+        new_cost = posting.cost
+        if posting.cost is not None:
+          new_cost = posting.cost._replace(number=posting.cost.number / ratio)
+        
+        new_price = posting.price
+        if posting.price is not None:
+          new_price = posting.price._replace(number=posting.price.number / ratio)
+        
+        new_postings.append(posting._replace(units=new_units, cost=new_cost, price=new_price))
+        modified = True
+      
+      if modified:
+        new_entries.append(entry._replace(postings=new_postings))
+      else:
+        new_entries.append(entry)
+        
+    elif isinstance(entry, Balance):
+       if entry.amount.currency in splits:
+         s = splits[entry.amount.currency]
+         if entry.date < s['date']:
+           ratio = Decimal(s['ratio'])
+           new_amount = Amount(entry.amount.number * ratio, entry.amount.currency)
+           new_entries.append(entry._replace(amount=new_amount))
+           continue
+       new_entries.append(entry)
+       
+    elif isinstance(entry, PriceEntry):
+       if entry.currency in splits:
+         s = splits[entry.currency]
+         if entry.date < s['date']:
+           ratio = Decimal(s['ratio'])
+           new_amount = Amount(entry.amount.number / ratio, entry.amount.currency)
+           new_entries.append(entry._replace(amount=new_amount))
+           continue
+       new_entries.append(entry)
+       
+    else:
+      new_entries.append(entry)
 
-  return entries, errors
+  return new_entries, errors
